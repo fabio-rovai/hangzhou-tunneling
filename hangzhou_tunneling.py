@@ -11,6 +11,7 @@ Usage:
 """
 
 import json
+import re
 import subprocess
 import time
 import select
@@ -41,24 +42,26 @@ class MCPClient:
         self._id = 0
 
     def start(self):
-        """Start the MCP server and complete the handshake."""
+        if not os.path.exists(self.server_path):
+            raise FileNotFoundError(
+                f"BITF server not found at {self.server_path}\n"
+                "Build it: cd brain-in-the-fish && cargo build --release\n"
+                "Or set BITF_SERVER=/path/to/brain-in-the-fish-mcp"
+            )
         self.proc = subprocess.Popen(
             [self.server_path],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
-        # Initialize
         resp = self._call("initialize", {
             "protocolVersion": "2024-11-05",
             "capabilities": {},
             "clientInfo": {"name": "hangzhou-tunneling", "version": "1.0"}
         })
-        # Send initialized notification
         self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         time.sleep(0.3)
         return resp
 
     def stop(self):
-        """Stop the MCP server."""
         if self.proc:
             self.proc.stdin.close()
             self.proc.terminate()
@@ -66,7 +69,6 @@ class MCPClient:
             self.proc = None
 
     def tool(self, name: str, arguments: dict) -> dict:
-        """Call an MCP tool and return the parsed result."""
         resp = self._call("tools/call", {"name": name, "arguments": arguments})
         if resp and "result" in resp:
             text = resp["result"].get("content", [{}])[0].get("text", "{}")
@@ -99,7 +101,6 @@ class MCPClient:
         return None
 
 
-# Global MCP client instance
 _mcp: Optional[MCPClient] = None
 
 
@@ -112,47 +113,164 @@ def get_mcp() -> MCPClient:
 
 
 # =============================================================================
+# Turtle validation
+# =============================================================================
+
+def validate_turtle(turtle_str: str) -> tuple[bool, str]:
+    """Check if Turtle is syntactically valid. Returns (ok, error_msg)."""
+    try:
+        from rdflib import Graph
+        g = Graph()
+        g.parse(data=turtle_str, format="turtle")
+        triple_count = len(g)
+        if triple_count == 0:
+            return False, "Turtle parsed but contains 0 triples"
+        return True, f"{triple_count} triples"
+    except ImportError:
+        # rdflib not installed — do basic checks
+        if "@prefix" not in turtle_str and "PREFIX" not in turtle_str:
+            return False, "No @prefix declarations found"
+        if "arg:" not in turtle_str:
+            return False, "No arg: namespace nodes found"
+        # Count lines that look like triples
+        triple_lines = [l for l in turtle_str.split("\n")
+                       if l.strip() and not l.strip().startswith("@") and not l.strip().startswith("#")]
+        if len(triple_lines) < 3:
+            return False, f"Only {len(triple_lines)} triple-like lines"
+        return True, f"~{len(triple_lines)} lines (rdflib not available for full validation)"
+    except Exception as e:
+        return False, f"Parse error: {e}"
+
+
+def extract_turtle_from_text(text: str) -> Optional[str]:
+    """Extract OWL Turtle from LLM output — handles code blocks, mixed text, etc."""
+    # Try ```turtle ... ``` block first
+    match = re.search(r"```(?:turtle|ttl|rdf)?\s*\n(.*?)```", text, re.DOTALL)
+    if match:
+        candidate = match.group(1).strip()
+        ok, _ = validate_turtle(candidate)
+        if ok:
+            return candidate
+
+    # Try finding @prefix ... to the last triple
+    match = re.search(r"(@prefix.*?)(?:\n\n[^@\s]|\Z)", text, re.DOTALL)
+    if match:
+        candidate = match.group(1).strip()
+        ok, _ = validate_turtle(candidate)
+        if ok:
+            return candidate
+
+    # Last resort — if text itself has prefixes
+    if "@prefix arg:" in text:
+        ok, _ = validate_turtle(text)
+        if ok:
+            return text
+
+    return None
+
+
+# =============================================================================
+# Direct scoring (no tool-calling, just prompt → parse JSON)
+# =============================================================================
+
+def direct_score(llm_cfg: dict, doc_text: str, criteria: list, agent_id: str, mcp: MCPClient) -> int:
+    """Score directly by prompting Qwen and parsing JSON — no tool-calling needed."""
+    criteria_list = "\n".join(f"- {c['id']}: {c['title']}" for c in criteria)
+
+    prompt = f"""Score this document against each criterion on a 0-10 scale.
+Return ONLY a JSON array, nothing else:
+[{{"criterion_id": "...", "score": N, "justification": "..."}}]
+
+Criteria:
+{criteria_list}
+
+Document (first 6000 chars):
+{doc_text[:6000]}"""
+
+    bot = Assistant(llm=llm_cfg, system_message="You are a document evaluator. Return only valid JSON.")
+    messages = [{"role": "user", "content": prompt}]
+
+    result_text = ""
+    for response in bot.run(messages=messages):
+        if isinstance(response, list):
+            for msg in response:
+                result_text = msg.get("content", "")
+
+    # Parse JSON from response
+    scores = []
+    try:
+        # Try direct parse
+        scores = json.loads(result_text)
+    except json.JSONDecodeError:
+        # Try extracting JSON array from text
+        match = re.search(r"\[.*\]", result_text, re.DOTALL)
+        if match:
+            try:
+                scores = json.loads(match.group())
+            except json.JSONDecodeError:
+                pass
+
+    recorded = 0
+    for s in scores:
+        cid = s.get("criterion_id", "")
+        score = s.get("score", 0)
+        justification = s.get("justification", "")
+        if cid and isinstance(score, (int, float)):
+            r = mcp.tool("eval_record_score", {
+                "agent_id": agent_id,
+                "criterion_id": cid,
+                "score": float(score),
+                "max_score": 10.0,
+                "justification": justification,
+                "round": 1,
+                "evidence_used": [],
+                "gaps_identified": [],
+            })
+            if r.get("ok"):
+                recorded += 1
+                print(f"   {cid}: {score}/10")
+
+    return recorded
+
+
+# =============================================================================
 # BITF Tools — registered with qwen-agent
 # =============================================================================
 
 @register_tool('bitf_ingest')
 class BITFIngest(BaseTool):
-    description = 'Ingest a document into the BITF evaluation server. Call this first.'
+    description = 'Ingest a document into the BITF evaluation server.'
     parameters = {
         'type': 'object',
         'properties': {
-            'path': {'type': 'string', 'description': 'Path to the document file'},
-            'intent': {'type': 'string', 'description': 'What to evaluate (e.g., "assess documentation quality")'},
+            'path': {'type': 'string', 'description': 'Path to the document'},
+            'intent': {'type': 'string', 'description': 'Evaluation intent'},
         },
         'required': ['path', 'intent']
     }
 
     def call(self, params: str, **kwargs) -> str:
-        args = json.loads(params)
-        result = get_mcp().tool("eval_ingest", args)
-        return json.dumps(result, ensure_ascii=False)
+        return json.dumps(get_mcp().tool("eval_ingest", json.loads(params)), ensure_ascii=False)
 
 
 @register_tool('bitf_criteria')
 class BITFCriteria(BaseTool):
-    description = 'Load evaluation criteria framework. Call after ingest.'
+    description = 'Load evaluation criteria framework.'
     parameters = {
         'type': 'object',
         'properties': {
-            'framework': {'type': 'string', 'description': 'Framework name: generic, academic, tender, clinical'},
+            'framework': {'type': 'string', 'description': 'Framework: generic, academic, tender, clinical'},
         },
         'required': ['framework']
     }
 
     def call(self, params: str, **kwargs) -> str:
-        args = json.loads(params)
-        result = get_mcp().tool("eval_criteria", args)
-        return json.dumps(result, ensure_ascii=False)
+        return json.dumps(get_mcp().tool("eval_criteria", json.loads(params)), ensure_ascii=False)
 
 
 @register_tool('bitf_spawn')
 class BITFSpawn(BaseTool):
-    description = 'Spawn evaluator agent panel. Call after criteria.'
+    description = 'Spawn evaluator agent panel.'
     parameters = {
         'type': 'object',
         'properties': {
@@ -162,14 +280,12 @@ class BITFSpawn(BaseTool):
     }
 
     def call(self, params: str, **kwargs) -> str:
-        args = json.loads(params)
-        result = get_mcp().tool("eval_spawn", args)
-        return json.dumps(result, ensure_ascii=False)
+        return json.dumps(get_mcp().tool("eval_spawn", json.loads(params)), ensure_ascii=False)
 
 
 @register_tool('bitf_load_turtle')
 class BITFLoadTurtle(BaseTool):
-    description = 'Load OWL Turtle (document decomposition) into the GraphStore. The Turtle must contain typed argument nodes with exact source quotes.'
+    description = 'Load OWL Turtle into the GraphStore.'
     parameters = {
         'type': 'object',
         'properties': {
@@ -180,21 +296,24 @@ class BITFLoadTurtle(BaseTool):
 
     def call(self, params: str, **kwargs) -> str:
         args = json.loads(params)
-        result = get_mcp().tool("eds_load_turtle", args)
-        return json.dumps(result, ensure_ascii=False)
+        # Validate before loading
+        ok, msg = validate_turtle(args.get("turtle", ""))
+        if not ok:
+            return json.dumps({"error": f"Invalid Turtle: {msg}"})
+        return json.dumps(get_mcp().tool("eds_load_turtle", args), ensure_ascii=False)
 
 
 @register_tool('bitf_record_score')
 class BITFRecordScore(BaseTool):
-    description = 'Record an LLM score for a criterion.'
+    description = 'Record a score for a criterion.'
     parameters = {
         'type': 'object',
         'properties': {
-            'agent_id': {'type': 'string', 'description': 'Agent ID'},
-            'criterion_id': {'type': 'string', 'description': 'Criterion ID'},
-            'score': {'type': 'number', 'description': 'Score (0-10)'},
-            'max_score': {'type': 'number', 'description': 'Max possible score'},
-            'justification': {'type': 'string', 'description': 'Why this score'},
+            'agent_id': {'type': 'string'},
+            'criterion_id': {'type': 'string'},
+            'score': {'type': 'number'},
+            'max_score': {'type': 'number'},
+            'justification': {'type': 'string'},
         },
         'required': ['agent_id', 'criterion_id', 'score', 'max_score', 'justification']
     }
@@ -204,99 +323,67 @@ class BITFRecordScore(BaseTool):
         args.setdefault("round", 1)
         args.setdefault("evidence_used", [])
         args.setdefault("gaps_identified", [])
-        result = get_mcp().tool("eval_record_score", args)
-        return json.dumps(result, ensure_ascii=False)
+        return json.dumps(get_mcp().tool("eval_record_score", args), ensure_ascii=False)
 
 
 @register_tool('bitf_score')
 class BITFScore(BaseTool):
-    description = 'Get the full BITF verdict: SPARQL rules, structural score, gate comparison. Call this last.'
+    description = 'Get the BITF verdict: SPARQL rules, structural score, gate.'
     parameters = {
         'type': 'object',
         'properties': {
-            'agent_id': {'type': 'string', 'description': 'Agent ID'},
+            'agent_id': {'type': 'string'},
         },
         'required': ['agent_id']
     }
 
     def call(self, params: str, **kwargs) -> str:
-        args = json.loads(params)
-        result = get_mcp().tool("eds_score", args)
-        return json.dumps(result, ensure_ascii=False)
+        return json.dumps(get_mcp().tool("eds_score", json.loads(params)), ensure_ascii=False)
 
 
 # =============================================================================
-# Agents
+# Agent prompts
 # =============================================================================
 
 DECOMPOSER_PROMPT = """You are the Document Decomposer for the Hangzhou Tunneling pipeline.
 
-Your job: read a document and decompose it into an OWL Turtle argument ontology.
+Your job: read a document and output an OWL Turtle argument ontology.
 
-IMPORTANT: Do NOT score nodes. Only identify, type, connect, and quote them.
-
-For every factual claim, evidence, citation, and structural element, create a typed node.
+IMPORTANT:
+- Do NOT score nodes. Only identify, type, connect, and quote them.
+- Every arg:hasText MUST be an EXACT copy-paste from the document. Do not paraphrase.
+- Output ONLY the Turtle inside a ```turtle code block. No other text.
 
 Node types: arg:Thesis, arg:SubClaim, arg:Evidence, arg:QuantifiedEvidence, arg:Citation, arg:Counter, arg:Rebuttal, arg:Structural
 
-Requirements:
-1. Every node MUST have arg:hasText with the EXACT quote from the document
-2. Every claim must be connected via arg:supports, arg:counters, or arg:rebuts
-3. Do NOT assign scores — the Rust engine handles scoring
+Relationships: arg:supports, arg:counters, arg:rebuts, arg:contains
 
-After decomposition, call bitf_load_turtle with your Turtle string.
-
-Schema:
+Required prefixes:
 @prefix arg: <http://brain-in-the-fish.dev/arg/> .
 @prefix owl: <http://www.w3.org/2002/07/owl#> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
-@prefix xsd: <http://www.w3.org/2001/XMLSchema#> ."""
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+Example node:
+arg:s0_0 a arg:Thesis ;
+    arg:hasText "Score any document. Prove every claim." .
+arg:s0_1 a arg:QuantifiedEvidence ;
+    arg:hasText "0 fabricated evidence out of 1,271 nodes tested" ;
+    arg:supports arg:s0_0 ."""
 
 SCORER_PROMPT = """You are the Document Scorer for the Hangzhou Tunneling pipeline.
 
-Your job: score the document against each evaluation criterion on a 0-10 scale.
+Score the document against each criterion on a 0-10 scale.
 
-For each criterion:
-1. Read the document carefully
-2. Assess quality against the criterion
-3. Call bitf_record_score with your score and justification
-4. Reference specific content from the document
+Return ONLY a JSON array:
+[{"criterion_id": "...", "score": N, "justification": "specific quote or reference"}]
 
-Be rigorous. Use exact quotes as evidence."""
+Be rigorous. Reference specific content from the document."""
 
 VERIFIER_PROMPT = """You are the Document Verifier for the Hangzhou Tunneling pipeline.
 
-Your job: get the final BITF verdict by calling bitf_score.
-
-The Rust engine will:
-1. Run SPARQL rules on the ontology (mining strong/weak/unsupported claims)
-2. Compute a structural score from topology (no LLM input)
-3. Compare the structural score against the LLM scores via the gate
-4. Return CONFIRMED, FLAGGED, or REJECTED
-
-Report the verdict with the full audit trail."""
-
-
-def create_agents(llm_cfg: dict):
-    decomposer = Assistant(
-        llm=llm_cfg,
-        name='Decomposer',
-        system_message=DECOMPOSER_PROMPT,
-        function_list=['bitf_ingest', 'bitf_criteria', 'bitf_spawn', 'bitf_load_turtle']
-    )
-    scorer = Assistant(
-        llm=llm_cfg,
-        name='Scorer',
-        system_message=SCORER_PROMPT,
-        function_list=['bitf_record_score']
-    )
-    verifier = Assistant(
-        llm=llm_cfg,
-        name='Verifier',
-        system_message=VERIFIER_PROMPT,
-        function_list=['bitf_score']
-    )
-    return decomposer, scorer, verifier
+Call the bitf_score tool with the provided agent_id to get the BITF verdict.
+Report the structural score, mined facts, and verdict."""
 
 
 # =============================================================================
@@ -304,19 +391,34 @@ def create_agents(llm_cfg: dict):
 # =============================================================================
 
 def run_pipeline(document_path: str, intent: str, llm_cfg: dict):
-    """Run the full Hangzhou Tunneling pipeline."""
+    """Run the full Hangzhou Tunneling pipeline with safeguards."""
 
     print("╔══════════════════════════════════════════════════════════════╗")
     print("║  HANGZHOU TUNNELING — Qwen Agents + BITF Verification      ║")
     print("╚══════════════════════════════════════════════════════════════╝")
 
+    if not os.path.exists(document_path):
+        print(f"Error: {document_path} not found")
+        sys.exit(1)
+
+    doc_text = open(document_path).read()
+
     # Start MCP server
     print("\nStarting BITF MCP server...")
-    mcp = get_mcp()
+    try:
+        mcp = get_mcp()
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
 
-    # Phase 1: Ingest + Decompose
+    # ── Phase 1: Ingest + Decompose ───────────────────────────────────
     print("\n── Phase 1: Ingest & Decompose ─────────────────────────────")
+
     r = mcp.tool("eval_ingest", {"path": os.path.abspath(document_path), "intent": intent})
+    if "error" in r:
+        print(f"   Ingest failed: {r['error']}")
+        mcp.stop()
+        sys.exit(1)
     print(f"   Ingested: {r.get('sections', '?')} sections, {r.get('triples_loaded', '?')} triples")
 
     r = mcp.tool("eval_criteria", {"framework": "generic"})
@@ -326,68 +428,134 @@ def run_pipeline(document_path: str, intent: str, llm_cfg: dict):
     r = mcp.tool("eval_spawn", {"intent": intent})
     agents = r.get("agents", [])
     agent_id = agents[0]["id"] if agents else None
+    if not agent_id:
+        print("   Spawn failed — no agents")
+        mcp.stop()
+        sys.exit(1)
     print(f"   Agents: {len(agents)} spawned, primary: {agent_id}")
 
-    # Create Qwen agents
-    decomposer, scorer, verifier = create_agents(llm_cfg)
+    # Run Qwen Decomposer
+    print("\n   Running Qwen Decomposer...")
+    decomposer = Assistant(
+        llm=llm_cfg,
+        name='Decomposer',
+        system_message=DECOMPOSER_PROMPT,
+    )
+    decompose_msg = [{"role": "user", "content": f"Decompose this document into OWL Turtle. Use EXACT quotes only.\n\n{doc_text[:8000]}"}]
 
-    # Run decomposer
-    print("\n   Running Qwen Decomposer agent...")
-    doc_text = open(document_path).read()
-    decompose_msg = [{"role": "user", "content": f"Decompose this document into an OWL Turtle argument ontology. Use EXACT quotes only.\n\nDocument:\n{doc_text[:8000]}"}]
+    turtle_str = None
+    try:
+        for response in decomposer.run(messages=decompose_msg):
+            if isinstance(response, list):
+                for msg in response:
+                    content = msg.get("content", "")
+                    if content:
+                        extracted = extract_turtle_from_text(content)
+                        if extracted:
+                            turtle_str = extracted
+    except Exception as e:
+        print(f"   Decomposer error: {e}")
 
-    turtle_result = None
-    for response in decomposer.run(messages=decompose_msg):
-        if isinstance(response, list):
-            for msg in response:
-                content = msg.get("content", "")
-                if "turtle" in content.lower() and "arg:" in content:
-                    turtle_result = content
-
-    if turtle_result:
-        r = mcp.tool("eds_load_turtle", {"turtle": turtle_result})
-        print(f"   Turtle loaded: {r.get('node_count', '?')} nodes, {r.get('triples_loaded', '?')} triples")
+    # Validate and load Turtle
+    turtle_loaded = False
+    if turtle_str:
+        ok, msg = validate_turtle(turtle_str)
+        if ok:
+            r = mcp.tool("eds_load_turtle", {"turtle": turtle_str})
+            node_count = r.get("node_count", 0)
+            if node_count > 0:
+                print(f"   Turtle loaded: {node_count} nodes, {r.get('triples_loaded', '?')} triples ({msg})")
+                turtle_loaded = True
+            else:
+                print(f"   Turtle loaded but 0 nodes detected — falling back")
+        else:
+            print(f"   Invalid Turtle: {msg} — falling back")
     else:
-        print("   ⚠ Decomposer did not produce Turtle — using fallback")
+        print(f"   Decomposer did not produce Turtle — falling back")
 
-    # Phase 2: Score
+    if not turtle_loaded:
+        print("   Fallback: using deterministic ingest (no ontology decomposition)")
+        # The MCP server already has the document from eval_ingest —
+        # structural score will be based on ingest triples only
+
+    # ── Phase 2: Score ────────────────────────────────────────────────
     print("\n── Phase 2: Score ──────────────────────────────────────────")
-    score_msg = [{"role": "user", "content": f"Score this document against these criteria: {json.dumps([c['title'] for c in criteria])}. The agent_id is {agent_id}. The criterion IDs are: {json.dumps({c['title']: c['id'] for c in criteria})}.\n\nDocument:\n{doc_text[:8000]}"}]
 
-    for response in scorer.run(messages=score_msg):
-        pass  # Scorer calls bitf_record_score via tools
-    print("   Scores recorded")
+    # Try agent-based tool-calling first
+    scorer = Assistant(
+        llm=llm_cfg,
+        name='Scorer',
+        system_message=SCORER_PROMPT,
+        function_list=['bitf_record_score']
+    )
+    criteria_info = json.dumps({c["title"]: c["id"] for c in criteria})
+    score_msg = [{"role": "user", "content": (
+        f"Score this document. agent_id={agent_id}\n"
+        f"Criterion IDs: {criteria_info}\n"
+        f"max_score=10 for all.\n\n"
+        f"Document:\n{doc_text[:6000]}"
+    )}]
 
-    # Phase 3: Verify
+    tool_scores_recorded = 0
+    try:
+        for response in scorer.run(messages=score_msg):
+            if isinstance(response, list):
+                for msg in response:
+                    content = msg.get("content", "")
+                    if "bitf_record_score" in str(msg.get("function_call", "")):
+                        tool_scores_recorded += 1
+    except Exception as e:
+        print(f"   Scorer agent error: {e}")
+
+    if tool_scores_recorded > 0:
+        print(f"   Agent recorded {tool_scores_recorded} scores via tool-calling")
+    else:
+        # Fallback: direct scoring (prompt → JSON → manual record)
+        print("   Agent tool-calling failed — using direct scoring fallback")
+        recorded = direct_score(llm_cfg, doc_text, criteria, agent_id, mcp)
+        print(f"   Direct scoring recorded {recorded}/{len(criteria)} scores")
+
+    # ── Phase 3: Verify ───────────────────────────────────────────────
     print("\n── Phase 3: Verify ─────────────────────────────────────────")
-    verify_msg = [{"role": "user", "content": f"Get the BITF verdict. The agent_id is {agent_id}. Call bitf_score."}]
 
-    for response in verifier.run(messages=verify_msg):
-        if isinstance(response, list):
-            for msg in response:
-                content = msg.get("content", "")
-                if "CONFIRMED" in content or "FLAGGED" in content or "REJECTED" in content:
-                    print(f"   {content[:200]}")
-
-    # Direct verdict call as fallback
+    # Always call directly — don't rely on agent tool-calling for the verdict
     r = mcp.tool("eds_score", {"agent_id": agent_id})
-    print(f"\n   Structural score: {r.get('structural_score', '?')}")
+
+    structural = r.get("structural_score", "?")
     topo = r.get("topology", {})
+    mined = r.get("mined_facts", {})
+    verdict = r.get("verdict", "")
+
+    print(f"   Structural score: {structural}")
     if topo:
         print(f"   Nodes: {topo.get('node_count', '?')} | Evidence: {topo.get('evidence_count', '?')} | Claims: {topo.get('claim_count', '?')}")
-    mined = r.get("mined_facts", {})
     if mined:
-        print(f"   Mined: strong={mined.get('strong_claims', '?')} unsupported={mined.get('unsupported_claims', '?')}")
-    verdict = r.get("verdict", "")
-    print(f"\n   ╔═══════════════════════════════════════════╗")
-    print(f"   ║  {str(verdict)[:50]}")
-    print(f"   ╚═══════════════════════════════════════════╝")
+        print(f"   SPARQL rules: strong={mined.get('strong_claims', '?')} weak={mined.get('weak_claims', '?')} unsupported={mined.get('unsupported_claims', '?')}")
+
+    # Audit trail
+    audit = r.get("audit_trail", [])
+    if audit:
+        print(f"   Audit trail: {len(audit)} nodes")
+
+    verdict_str = str(verdict)
+    if "CONFIRMED" in verdict_str:
+        badge = "VERIFIED"
+    elif "FLAGGED" in verdict_str:
+        badge = "FLAGGED"
+    else:
+        badge = "REJECTED"
+
+    print(f"\n   ╔═══════════════════════════════════════════════════╗")
+    print(f"   ║  VERDICT: {verdict_str[:48]}")
+    print(f"   ╚═══════════════════════════════════════════════════╝")
 
     mcp.stop()
 
-    print("\n╔══════════════════════════════════════════════════════════════╗")
-    print("║  PIPELINE COMPLETE                                          ║")
-    print("╚══════════════════════════════════════════════════════════════╝")
+    print(f"\n╔══════════════════════════════════════════════════════════════╗")
+    print(f"║  PIPELINE COMPLETE — Badge: BITF {badge:<25}║")
+    print(f"╚══════════════════════════════════════════════════════════════╝")
+
+    return badge
 
 
 # =============================================================================
@@ -395,19 +563,20 @@ def run_pipeline(document_path: str, intent: str, llm_cfg: dict):
 # =============================================================================
 
 if __name__ == "__main__":
-    if len(sys.argv) < 4 or sys.argv[1] != "evaluate":
+    if len(sys.argv) < 3 or sys.argv[1] != "evaluate":
         print("Usage: python hangzhou_tunneling.py evaluate <document> --intent <intent>")
         print()
         print("Options:")
+        print("  --intent <text>    What to evaluate (required)")
         print("  --model <name>     Qwen model (default: Qwen3-8B)")
-        print("  --server <url>     Model server URL (default: http://localhost:8000/v1)")
+        print("  --server <url>     Model server URL (default: http://localhost:11434/v1)")
         print("  --dashscope        Use DashScope API instead of local server")
         sys.exit(1)
 
     document = sys.argv[2]
     intent = "assess document quality"
     model = "Qwen3-8B"
-    server_url = "http://localhost:8000/v1"
+    server_url = "http://localhost:11434/v1"
     use_dashscope = False
 
     i = 3
@@ -429,16 +598,16 @@ if __name__ == "__main__":
 
     if use_dashscope:
         llm_cfg = {
-            'model': model if model != "Qwen3-8B" else 'qwen-max-latest',
-            'model_type': 'qwen_dashscope',
-            'generate_cfg': {'top_p': 0.8}
+            "model": model if model != "Qwen3-8B" else "qwen-max-latest",
+            "model_type": "qwen_dashscope",
+            "generate_cfg": {"top_p": 0.8},
         }
     else:
         llm_cfg = {
-            'model': model,
-            'model_server': server_url,
-            'api_key': 'EMPTY',
-            'generate_cfg': {'top_p': 0.8}
+            "model": model,
+            "model_server": server_url,
+            "api_key": "EMPTY",
+            "generate_cfg": {"top_p": 0.8},
         }
 
     run_pipeline(document, intent, llm_cfg)
