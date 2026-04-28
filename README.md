@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/fabio-rovai-hangzhou-tunneling-badge.png)](https://mseep.ai/app/fabio-rovai-hangzhou-tunneling)
+
 # Hangzhou Tunneling
 
 Qwen-Agent powered document evaluation with [Brain in the Fish](https://github.com/fabio-rovai/brain-in-the-fish) verification.
