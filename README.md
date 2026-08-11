@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/fabio-rovai-hangzhou-tunneling-badge.png)](https://mseep.ai/app/fabio-rovai-hangzhou-tunneling)
+
 # Hangzhou Tunneling
 
 [![Sponsor](https://img.shields.io/github/sponsors/fabio-rovai?label=Sponsor&logo=GitHub%20Sponsors&logoColor=EA4AAA&color=EA4AAA)](https://github.com/sponsors/fabio-rovai)
