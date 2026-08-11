@@ -1,5 +1,7 @@
 # Hangzhou Tunneling
 
+[![Sponsor](https://img.shields.io/github/sponsors/fabio-rovai?label=Sponsor&logo=GitHub%20Sponsors&logoColor=EA4AAA&color=EA4AAA)](https://github.com/sponsors/fabio-rovai)
+
 Qwen-Agent powered document evaluation with [Brain in the Fish](https://github.com/fabio-rovai/brain-in-the-fish) verification.
 
 Three Qwen agents orchestrate document evaluation. The Rust engine verifies everything.
@@ -79,3 +81,9 @@ hangzhou_tunneling.py
 ## License
 
 MIT
+
+---
+
+## Sponsor
+
+If this work is useful to you, you can support its continued development through [GitHub Sponsors](https://github.com/sponsors/fabio-rovai).
